@@ -13,12 +13,14 @@ const CONFIG = {
   // Homologación (Testing)
   homo: {
     wsaa: 'https://wsaahomo.afip.gov.ar/ws/services/LoginCms?WSDL',
-    wsfe: 'https://wswhomo.afip.gov.ar/wsfev1/service.asmx?WSDL'
+    wsfe: 'https://wswhomo.afip.gov.ar/wsfev1/service.asmx?WSDL',
+    padron: 'https://awshomo.afip.gov.ar/sr-padron/ws/include/ws_sr_constancia_inscripcion.wsdl'
   },
   // Producción
   prod: {
     wsaa: 'https://wsaa.afip.gov.ar/ws/services/LoginCms?WSDL',
-    wsfe: 'https://servicios1.afip.gov.ar/wsfev1/service.asmx?WSDL'
+    wsfe: 'https://servicios1.afip.gov.ar/wsfev1/service.asmx?WSDL',
+    padron: 'https://aws.afip.gov.ar/sr-padron/ws/include/ws_sr_constancia_inscripcion.wsdl'
   }
 };
 
@@ -572,7 +574,68 @@ app.get('/dummy', async (req, res) => {
 // ==================== INICIAR SERVIDOR ====================
 
 const PORT = process.env.PORT || 3000;
+/**
+ * Consultar datos de contribuyente por CUIT
+ */
+app.post('/consultar-contribuyente', async (req, res) => {
+  try {
+    const { cuit, cert, key, cuitConsulta, environment = 'homo' } = req.body;
 
+    if (!cuit || !cert || !key || !cuitConsulta) {
+      return res.status(400).json({ error: 'Faltan parámetros: cuit, cert, key, cuitConsulta' });
+    }
+
+    // Reutiliza getTokenSign pero para el servicio de padrón
+    const tra = createTRA('ws_sr_constancia_inscripcion');
+    const cms = signTRA(tra, cert, key);
+
+    const wsaaUrl = CONFIG[environment].wsaa;
+    const wsaaClient = await soap.createClientAsync(wsaaUrl);
+    const [wsaaResult] = await wsaaClient.loginCmsAsync({ in0: cms });
+
+    const loginTicketResponse = wsaaResult.loginCmsReturn;
+    const token = loginTicketResponse.match(/<token>([\s\S]*?)<\/token>/)[1].trim();
+    const sign = loginTicketResponse.match(/<sign>([\s\S]*?)<\/sign>/)[1].trim();
+
+    // Llamar al web service de padrón
+    const padronUrl = CONFIG[environment].padron;
+    const padronClient = await soap.createClientAsync(padronUrl);
+
+    const [result] = await padronClient.getPersona_v2Async({
+      token,
+      sign,
+      cuitRepresentada: cuit,
+      idPersona: cuitConsulta
+    });
+
+    const persona = result.personaReturn?.datosGenerales;
+
+    if (!persona) {
+      return res.status(404).json({ success: false, error: 'Contribuyente no encontrado' });
+    }
+
+    res.json({
+      success: true,
+      cuit: cuitConsulta,
+      nombre: persona.razonSocial || `${persona.apellido}, ${persona.nombre}`,
+      tipoPersona: persona.tipoPersona, // JURIDICA o FISICA
+      domicilioFiscal: {
+        calle: persona.domicilioFiscal?.direccion || '',
+        localidad: persona.domicilioFiscal?.localidad || '',
+        provincia: persona.domicilioFiscal?.descripcionProvincia || '',
+        codigoPostal: persona.domicilioFiscal?.codPostal || ''
+      },
+      condicionIva: persona.estadoClave // ACTIVO, INACTIVO, etc.
+    });
+
+  } catch (error) {
+    console.error('Error en /consultar-contribuyente:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
 app.listen(PORT, () => {
   console.log(`🚀 API de Facturación ARCA corriendo en puerto ${PORT}`);
   console.log(`📋 Endpoints disponibles:`);
