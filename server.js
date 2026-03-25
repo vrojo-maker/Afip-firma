@@ -10,13 +10,11 @@ app.use(express.json({ limit: '10mb' }));
 
 // Configuración de URLs
 const CONFIG = {
-  // Homologación (Testing)
   homo: {
     wsaa: 'https://wsaahomo.afip.gov.ar/ws/services/LoginCms?WSDL',
     wsfe: 'https://wswhomo.afip.gov.ar/wsfev1/service.asmx?WSDL',
     padron: 'https://awshomo.afip.gov.ar/sr-padron/ws/include/ws_sr_constancia_inscripcion.wsdl'
   },
-  // Producción
   prod: {
     wsaa: 'https://wsaa.afip.gov.ar/ws/services/LoginCms?WSDL',
     wsfe: 'https://servicios1.afip.gov.ar/wsfev1/service.asmx?WSDL',
@@ -24,25 +22,19 @@ const CONFIG = {
   }
 };
 
-// Cache de tokens (en producción usar Redis)
+// Cache de tokens
 const tokenCache = new Map();
 
 // ==================== FUNCIONES AUXILIARES ====================
 
-/**
- * Genera un ID único para archivos temporales
- */
 function generateId() {
   return `${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
 }
 
-/**
- * Crea el TRA (Ticket de Requerimiento de Acceso)
- */
 function createTRA(service = 'wsfe') {
   const now = new Date();
-  const generationTime = new Date(now.getTime() - 600000).toISOString(); // 10 min antes
-  const expirationTime = new Date(now.getTime() + 600000).toISOString(); // 10 min después
+  const generationTime = new Date(now.getTime() - 600000).toISOString();
+  const expirationTime = new Date(now.getTime() + 600000).toISOString();
   const uniqueId = Math.floor(Date.now() / 1000);
 
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -56,9 +48,6 @@ function createTRA(service = 'wsfe') {
 </loginTicketRequest>`;
 }
 
-/**
- * Firma el TRA y genera el CMS en Base64
- */
 function signTRA(tra, cert, key) {
   const id = generateId();
   const tmpDir = '/tmp';
@@ -69,37 +58,29 @@ function signTRA(tra, cert, key) {
   const cmsPath = path.join(tmpDir, `cms_${id}.pem`);
 
   try {
-    // DEBUG: Ver qué está llegando
     console.log('KEY recibida (primeros 100 chars):', key.substring(0, 100));
     console.log('KEY contiene \\n literales?', key.includes('\\n'));
     
-    // Normalizar saltos de línea (por si vienen escapados desde Google Sheets)
     const certNormalized = cert.replace(/\\n/g, '\n');
     const keyNormalized = key.replace(/\\n/g, '\n');
     
-    // DEBUG: Ver después de normalizar
     console.log('KEY normalizada (primeros 100 chars):', keyNormalized.substring(0, 100));
 
-    // Guardar archivos temporales con codificación UTF-8 explícita
     fs.writeFileSync(certPath, certNormalized, 'utf8');
     fs.writeFileSync(keyPath, keyNormalized, 'utf8');
     fs.writeFileSync(traPath, tra, 'utf8');
     
-    // DEBUG: Ver qué se guardó
     const savedKey = fs.readFileSync(keyPath, 'utf8');
     console.log('KEY guardada en archivo (primeros 100 chars):', savedKey.substring(0, 100));
     console.log('Tamaño del archivo KEY:', savedKey.length);
 
-    // Firmar con OpenSSL
     execSync(
       `openssl cms -sign -in "${traPath}" -out "${cmsPath}" -signer "${certPath}" -inkey "${keyPath}" -nodetach -outform PEM`,
       { stdio: 'pipe' }
     );
 
-    // Leer el CMS firmado
     let cms = fs.readFileSync(cmsPath, 'utf8');
     
-    // Extraer solo el contenido base64 (sin headers)
     cms = cms
       .replace('-----BEGIN CMS-----', '')
       .replace('-----END CMS-----', '')
@@ -108,7 +89,6 @@ function signTRA(tra, cert, key) {
 
     return cms;
   } finally {
-    // Limpiar archivos temporales
     [certPath, keyPath, traPath, cmsPath].forEach(f => {
       try { fs.unlinkSync(f); } catch (e) {}
     });
@@ -116,31 +96,29 @@ function signTRA(tra, cert, key) {
 }
 
 /**
- * Obtiene el Token y Sign del WSAA
+ * Obtiene token/sign del WSAA para un servicio específico
+ * FIX: la clave de cache incluye el servicio para evitar reutilizar
+ * tokens de wsfe en ws_sr_constancia_inscripcion
  */
-async function getTokenSign(cuit, cert, key, environment = 'homo') {
-  // Verificar cache
-  const cacheKey = `${cuit}_${environment}`;
+async function getTokenSign(cuit, cert, key, environment = 'homo', service = 'wsfe') {
+  const cacheKey = `${cuit}_${environment}_${service}`;  // ← CORREGIDO
   const cached = tokenCache.get(cacheKey);
   
   if (cached && cached.expiration > new Date()) {
-    console.log(`[${cuit}] Usando token cacheado`);
+    console.log(`[${cuit}] Usando token cacheado para ${service}`);
     return { token: cached.token, sign: cached.sign };
   }
 
-  console.log(`[${cuit}] Solicitando nuevo token...`);
+  console.log(`[${cuit}] Solicitando nuevo token para ${service}...`);
 
-  // Crear y firmar TRA
-  const tra = createTRA('wsfe');
+  const tra = createTRA(service);
   const cms = signTRA(tra, cert, key);
 
-  // Llamar al WSAA
   const wsaaUrl = CONFIG[environment].wsaa;
   const client = await soap.createClientAsync(wsaaUrl);
   
   const [result] = await client.loginCmsAsync({ in0: cms });
   
-  // Parsear respuesta
   const loginTicketResponse = result.loginCmsReturn;
   
   const tokenMatch = loginTicketResponse.match(/<token>([\s\S]*?)<\/token>/);
@@ -155,17 +133,13 @@ async function getTokenSign(cuit, cert, key, environment = 'homo') {
   const sign = signMatch[1].trim();
   const expiration = expirationMatch ? new Date(expirationMatch[1]) : new Date(Date.now() + 11 * 60 * 60 * 1000);
 
-  // Guardar en cache
   tokenCache.set(cacheKey, { token, sign, expiration });
 
-  console.log(`[${cuit}] Token obtenido, expira: ${expiration}`);
+  console.log(`[${cuit}] Token obtenido para ${service}, expira: ${expiration}`);
 
   return { token, sign };
 }
 
-/**
- * Obtiene el cliente SOAP del WSFE
- */
 async function getWSFEClient(environment = 'homo') {
   const wsfeUrl = CONFIG[environment].wsfe;
   return await soap.createClientAsync(wsfeUrl);
@@ -173,16 +147,10 @@ async function getWSFEClient(environment = 'homo') {
 
 // ==================== ENDPOINTS ====================
 
-/**
- * Health check
- */
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-/**
- * Obtener último comprobante autorizado
- */
 app.post('/ultimo-comprobante', async (req, res) => {
   try {
     const { cuit, cert, key, puntoVenta, tipoComprobante, environment = 'homo' } = req.body;
@@ -191,10 +159,7 @@ app.post('/ultimo-comprobante', async (req, res) => {
       return res.status(400).json({ error: 'Faltan parámetros requeridos' });
     }
 
-    // Obtener token
-    const { token, sign } = await getTokenSign(cuit, cert, key, environment);
-
-    // Llamar al WSFE
+    const { token, sign } = await getTokenSign(cuit, cert, key, environment, 'wsfe');
     const client = await getWSFEClient(environment);
     
     const [result] = await client.FECompUltimoAutorizadoAsync({
@@ -222,27 +187,16 @@ app.post('/ultimo-comprobante', async (req, res) => {
   }
 });
 
-/**
- * Crear factura (solicitar CAE)
- */
 app.post('/crear-factura', async (req, res) => {
   try {
-    const { 
-      cuit, 
-      cert, 
-      key, 
-      environment = 'homo',
-      factura 
-    } = req.body;
+    const { cuit, cert, key, environment = 'homo', factura } = req.body;
 
     if (!cuit || !cert || !key || !factura) {
       return res.status(400).json({ error: 'Faltan parámetros requeridos' });
     }
 
-    // Obtener token
-    const { token, sign } = await getTokenSign(cuit, cert, key, environment);
+    const { token, sign } = await getTokenSign(cuit, cert, key, environment, 'wsfe');
 
-    // Preparar request
     const feCAEReq = {
       FeCabReq: {
         CantReg: factura.CantReg || 1,
@@ -269,12 +223,10 @@ app.post('/crear-factura', async (req, res) => {
       }
     };
 
-    // Agregar CondicionIVAReceptorId si existe (obligatorio desde abril 2025)
     if (factura.CondicionIVAReceptorId) {
       feCAEReq.FeDetReq.FECAEDetRequest[0].CondicionIVAReceptorId = factura.CondicionIVAReceptorId;
     }
 
-    // Agregar IVA si existe
     if (factura.Iva && factura.Iva.length > 0) {
       feCAEReq.FeDetReq.FECAEDetRequest[0].Iva = {
         AlicIva: factura.Iva.map(iva => ({
@@ -285,28 +237,20 @@ app.post('/crear-factura', async (req, res) => {
       };
     }
 
-    // Agregar tributos si existen
     if (factura.Tributos && factura.Tributos.length > 0) {
-      feCAEReq.FeDetReq.FECAEDetRequest[0].Tributos = {
-        Tributo: factura.Tributos
-      };
+      feCAEReq.FeDetReq.FECAEDetRequest[0].Tributos = { Tributo: factura.Tributos };
     }
 
-    // Agregar comprobantes asociados si existen (para notas de crédito/débito)
     if (factura.CbtesAsoc && factura.CbtesAsoc.length > 0) {
-      feCAEReq.FeDetReq.FECAEDetRequest[0].CbtesAsoc = {
-        CbteAsoc: factura.CbtesAsoc
-      };
+      feCAEReq.FeDetReq.FECAEDetRequest[0].CbtesAsoc = { CbteAsoc: factura.CbtesAsoc };
     }
 
-    // Agregar datos de servicios si es concepto 2 o 3
     if (factura.Concepto === 2 || factura.Concepto === 3) {
       feCAEReq.FeDetReq.FECAEDetRequest[0].FchServDesde = factura.FchServDesde;
       feCAEReq.FeDetReq.FECAEDetRequest[0].FchServHasta = factura.FchServHasta;
       feCAEReq.FeDetReq.FECAEDetRequest[0].FchVtoPago = factura.FchVtoPago;
     }
 
-    // Llamar al WSFE
     const client = await getWSFEClient(environment);
     
     const [result] = await client.FECAESolicitarAsync({
@@ -318,7 +262,6 @@ app.post('/crear-factura', async (req, res) => {
     const cabResp = response.FeCabResp;
     const detResp = response.FeDetResp?.FECAEDetResponse?.[0];
 
-    // Preparar respuesta
     const respuesta = {
       success: cabResp.Resultado === 'A',
       resultado: cabResp.Resultado,
@@ -336,13 +279,11 @@ app.post('/crear-factura', async (req, res) => {
         resultado: detResp.Resultado
       };
 
-      // Agregar observaciones si existen
       if (detResp.Observaciones) {
         respuesta.observaciones = detResp.Observaciones.Obs || detResp.Observaciones;
       }
     }
 
-    // Agregar errores si existen
     if (response.Errors) {
       respuesta.errores = response.Errors.Err || response.Errors;
     }
@@ -359,9 +300,6 @@ app.post('/crear-factura', async (req, res) => {
   }
 });
 
-/**
- * Consultar comprobante
- */
 app.post('/consultar-comprobante', async (req, res) => {
   try {
     const { cuit, cert, key, puntoVenta, tipoComprobante, numeroComprobante, environment = 'homo' } = req.body;
@@ -370,10 +308,7 @@ app.post('/consultar-comprobante', async (req, res) => {
       return res.status(400).json({ error: 'Faltan parámetros requeridos' });
     }
 
-    // Obtener token
-    const { token, sign } = await getTokenSign(cuit, cert, key, environment);
-
-    // Llamar al WSFE
+    const { token, sign } = await getTokenSign(cuit, cert, key, environment, 'wsfe');
     const client = await getWSFEClient(environment);
     
     const [result] = await client.FECompConsultarAsync({
@@ -395,166 +330,89 @@ app.post('/consultar-comprobante', async (req, res) => {
 
   } catch (error) {
     console.error('Error en /consultar-comprobante:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-/**
- * Obtener tipos de comprobante
- */
 app.post('/tipos-comprobante', async (req, res) => {
   try {
     const { cuit, cert, key, environment = 'homo' } = req.body;
+    if (!cuit || !cert || !key) return res.status(400).json({ error: 'Faltan parámetros requeridos' });
 
-    if (!cuit || !cert || !key) {
-      return res.status(400).json({ error: 'Faltan parámetros requeridos' });
-    }
-
-    const { token, sign } = await getTokenSign(cuit, cert, key, environment);
+    const { token, sign } = await getTokenSign(cuit, cert, key, environment, 'wsfe');
     const client = await getWSFEClient(environment);
-    
-    const [result] = await client.FEParamGetTiposCbteAsync({
-      Auth: { Token: token, Sign: sign, Cuit: cuit }
-    });
+    const [result] = await client.FEParamGetTiposCbteAsync({ Auth: { Token: token, Sign: sign, Cuit: cuit } });
 
-    res.json({
-      success: true,
-      tipos: result.FEParamGetTiposCbteResult.ResultGet?.CbteTipo || []
-    });
-
+    res.json({ success: true, tipos: result.FEParamGetTiposCbteResult.ResultGet?.CbteTipo || [] });
   } catch (error) {
-    console.error('Error en /tipos-comprobante:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-/**
- * Obtener tipos de documento
- */
 app.post('/tipos-documento', async (req, res) => {
   try {
     const { cuit, cert, key, environment = 'homo' } = req.body;
+    if (!cuit || !cert || !key) return res.status(400).json({ error: 'Faltan parámetros requeridos' });
 
-    if (!cuit || !cert || !key) {
-      return res.status(400).json({ error: 'Faltan parámetros requeridos' });
-    }
-
-    const { token, sign } = await getTokenSign(cuit, cert, key, environment);
+    const { token, sign } = await getTokenSign(cuit, cert, key, environment, 'wsfe');
     const client = await getWSFEClient(environment);
-    
-    const [result] = await client.FEParamGetTiposDocAsync({
-      Auth: { Token: token, Sign: sign, Cuit: cuit }
-    });
+    const [result] = await client.FEParamGetTiposDocAsync({ Auth: { Token: token, Sign: sign, Cuit: cuit } });
 
-    res.json({
-      success: true,
-      tipos: result.FEParamGetTiposDocResult.ResultGet?.DocTipo || []
-    });
-
+    res.json({ success: true, tipos: result.FEParamGetTiposDocResult.ResultGet?.DocTipo || [] });
   } catch (error) {
-    console.error('Error en /tipos-documento:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-/**
- * Obtener tipos de IVA
- */
 app.post('/tipos-iva', async (req, res) => {
   try {
     const { cuit, cert, key, environment = 'homo' } = req.body;
+    if (!cuit || !cert || !key) return res.status(400).json({ error: 'Faltan parámetros requeridos' });
 
-    if (!cuit || !cert || !key) {
-      return res.status(400).json({ error: 'Faltan parámetros requeridos' });
-    }
-
-    const { token, sign } = await getTokenSign(cuit, cert, key, environment);
+    const { token, sign } = await getTokenSign(cuit, cert, key, environment, 'wsfe');
     const client = await getWSFEClient(environment);
-    
-    const [result] = await client.FEParamGetTiposIvaAsync({
-      Auth: { Token: token, Sign: sign, Cuit: cuit }
-    });
+    const [result] = await client.FEParamGetTiposIvaAsync({ Auth: { Token: token, Sign: sign, Cuit: cuit } });
 
-    res.json({
-      success: true,
-      tipos: result.FEParamGetTiposIvaResult.ResultGet?.IvaTipo || []
-    });
-
+    res.json({ success: true, tipos: result.FEParamGetTiposIvaResult.ResultGet?.IvaTipo || [] });
   } catch (error) {
-    console.error('Error en /tipos-iva:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-/**
- * Obtener condiciones IVA receptor
- */
 app.post('/condiciones-iva-receptor', async (req, res) => {
   try {
     const { cuit, cert, key, environment = 'homo' } = req.body;
+    if (!cuit || !cert || !key) return res.status(400).json({ error: 'Faltan parámetros requeridos' });
 
-    if (!cuit || !cert || !key) {
-      return res.status(400).json({ error: 'Faltan parámetros requeridos' });
-    }
-
-    const { token, sign } = await getTokenSign(cuit, cert, key, environment);
+    const { token, sign } = await getTokenSign(cuit, cert, key, environment, 'wsfe');
     const client = await getWSFEClient(environment);
-    
-    const [result] = await client.FEParamGetCondicionIvaReceptorAsync({
-      Auth: { Token: token, Sign: sign, Cuit: cuit }
-    });
+    const [result] = await client.FEParamGetCondicionIvaReceptorAsync({ Auth: { Token: token, Sign: sign, Cuit: cuit } });
 
-    res.json({
-      success: true,
-      condiciones: result.FEParamGetCondicionIvaReceptorResult.ResultGet?.CondicionIvaReceptor || []
-    });
-
+    res.json({ success: true, condiciones: result.FEParamGetCondicionIvaReceptorResult.ResultGet?.CondicionIvaReceptor || [] });
   } catch (error) {
-    console.error('Error en /condiciones-iva-receptor:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-/**
- * Obtener puntos de venta
- */
 app.post('/puntos-venta', async (req, res) => {
   try {
     const { cuit, cert, key, environment = 'homo' } = req.body;
+    if (!cuit || !cert || !key) return res.status(400).json({ error: 'Faltan parámetros requeridos' });
 
-    if (!cuit || !cert || !key) {
-      return res.status(400).json({ error: 'Faltan parámetros requeridos' });
-    }
-
-    const { token, sign } = await getTokenSign(cuit, cert, key, environment);
+    const { token, sign } = await getTokenSign(cuit, cert, key, environment, 'wsfe');
     const client = await getWSFEClient(environment);
-    
-    const [result] = await client.FEParamGetPtosVentaAsync({
-      Auth: { Token: token, Sign: sign, Cuit: cuit }
-    });
+    const [result] = await client.FEParamGetPtosVentaAsync({ Auth: { Token: token, Sign: sign, Cuit: cuit } });
 
-    res.json({
-      success: true,
-      puntosVenta: result.FEParamGetPtosVentaResult.ResultGet?.PtoVenta || []
-    });
-
+    res.json({ success: true, puntosVenta: result.FEParamGetPtosVentaResult.ResultGet?.PtoVenta || [] });
   } catch (error) {
-    console.error('Error en /puntos-venta:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-/**
- * Dummy - verificar estado del servicio ARCA
- */
 app.get('/dummy', async (req, res) => {
   try {
     const environment = req.query.environment || 'homo';
     const client = await getWSFEClient(environment);
-    
     const [result] = await client.FEDummyAsync({});
 
     res.json({
@@ -564,18 +422,14 @@ app.get('/dummy', async (req, res) => {
       dbServer: result.FEDummyResult.DbServer,
       authServer: result.FEDummyResult.AuthServer
     });
-
   } catch (error) {
-    console.error('Error en /dummy:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// ==================== INICIAR SERVIDOR ====================
-
-const PORT = process.env.PORT || 3000;
 /**
  * Consultar datos de contribuyente por CUIT
+ * Usa ws_sr_constancia_inscripcion (requiere habilitación en ARCA)
  */
 app.post('/consultar-contribuyente', async (req, res) => {
   try {
@@ -585,19 +439,10 @@ app.post('/consultar-contribuyente', async (req, res) => {
       return res.status(400).json({ error: 'Faltan parámetros: cuit, cert, key, cuitConsulta' });
     }
 
-    // Reutiliza getTokenSign pero para el servicio de padrón
-    const tra = createTRA('ws_sr_constancia_inscripcion');
-    const cms = signTRA(tra, cert, key);
+    // Token específico para el servicio de padrón (distinto al de wsfe)
+    const { token, sign } = await getTokenSign(cuit, cert, key, environment, 'ws_sr_constancia_inscripcion');
 
-    const wsaaUrl = CONFIG[environment].wsaa;
-    const wsaaClient = await soap.createClientAsync(wsaaUrl);
-    const [wsaaResult] = await wsaaClient.loginCmsAsync({ in0: cms });
-
-    const loginTicketResponse = wsaaResult.loginCmsReturn;
-    const token = loginTicketResponse.match(/<token>([\s\S]*?)<\/token>/)[1].trim();
-    const sign = loginTicketResponse.match(/<sign>([\s\S]*?)<\/sign>/)[1].trim();
-
-    // Llamar al web service de padrón
+    // Cliente SOAP del padrón
     const padronUrl = CONFIG[environment].padron;
     const padronClient = await soap.createClientAsync(padronUrl);
 
@@ -605,7 +450,7 @@ app.post('/consultar-contribuyente', async (req, res) => {
       token,
       sign,
       cuitRepresentada: cuit,
-      idPersona: cuitConsulta
+      idPersona: Number(cuitConsulta)  // ARCA requiere número, no string
     });
 
     const persona = result.personaReturn?.datosGenerales;
@@ -618,14 +463,14 @@ app.post('/consultar-contribuyente', async (req, res) => {
       success: true,
       cuit: cuitConsulta,
       nombre: persona.razonSocial || `${persona.apellido}, ${persona.nombre}`,
-      tipoPersona: persona.tipoPersona, // JURIDICA o FISICA
+      tipoPersona: persona.tipoPersona,
       domicilioFiscal: {
         calle: persona.domicilioFiscal?.direccion || '',
         localidad: persona.domicilioFiscal?.localidad || '',
         provincia: persona.domicilioFiscal?.descripcionProvincia || '',
         codigoPostal: persona.domicilioFiscal?.codPostal || ''
       },
-      condicionIva: persona.estadoClave // ACTIVO, INACTIVO, etc.
+      condicionIva: persona.estadoClave
     });
 
   } catch (error) {
@@ -636,6 +481,11 @@ app.post('/consultar-contribuyente', async (req, res) => {
     });
   }
 });
+
+// ==================== INICIAR SERVIDOR ====================
+
+const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
   console.log(`🚀 API de Facturación ARCA corriendo en puerto ${PORT}`);
   console.log(`📋 Endpoints disponibles:`);
@@ -649,4 +499,5 @@ app.listen(PORT, () => {
   console.log(`   POST /tipos-iva`);
   console.log(`   POST /condiciones-iva-receptor`);
   console.log(`   POST /puntos-venta`);
+  console.log(`   POST /consultar-contribuyente`);
 });
